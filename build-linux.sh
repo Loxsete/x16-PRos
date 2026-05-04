@@ -15,8 +15,8 @@ FLAG_NO_LOGO_DISPLAY=0
 FLAG_NO_SETUP=0
 FLAG_DTM=0  # DTM - Dev Tesing Mode
 
-MAX_KERNEL_LOADER_BYTES=32768
-KERNEL_SIZE_WARN_BYTES=30720
+MAX_KERNEL_LOADER_BYTES=43008   # 0xA800 - kernel image must end before dirlist
+KERNEL_SIZE_WARN_BYTES=40960    # 0xA000 - warn 2 KiB before the ceiling
 
 for arg in $@; do
     if [ $arg == "-quiet" ]; then FLAG_QUIET_MODE=1; continue; fi

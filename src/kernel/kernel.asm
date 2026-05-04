@@ -48,7 +48,14 @@ COM_ENTRY_OFFSET     equ 0x0100
 KERNEL_DATA_SEG      equ 0x2000
 FONT_SEG             equ 0x1000
 
+PROGRAM_LOAD_SEG     equ 0x1000
 PROGRAM_LOAD_OFF     equ 0x8000
+PROGRAM_THUNK_OFF    equ 0x7FF0
+PROGRAM_PARAMS_OFF   equ 0x7F00
+
+CFG_SCRATCH_SEG      equ FONT_SEG
+CFG_SCRATCH_OFF      equ 0x1000
+
 DIRLIST_OFF          equ 0xA800
 COMMAND_HISTORY_OFF  equ 0xD000
 DISK_BUFFER_OFF      equ 0xE000
@@ -56,7 +63,6 @@ DISK_BUFFER_SIZE     equ 0x1C00
 KERNEL_WORK_END_OFF  equ DISK_BUFFER_OFF + DISK_BUFFER_SIZE  ; 0xFC00
 
 disk_buffer          equ DISK_BUFFER_OFF
-program_load_addr    equ PROGRAM_LOAD_OFF
 dirlist              equ DIRLIST_OFF
 command_history      equ COMMAND_HISTORY_OFF
 program_seg          equ 0x2FC0
@@ -307,31 +313,15 @@ print_help:
     jc .restore_and_builtin
 
     mov ax, .help_bin_file
-    xor bx, bx
-    mov cx, program_load_addr
-    call fs_load_file
+    mov cx, PROGRAM_LOAD_OFF
+    mov dx, PROGRAM_LOAD_SEG
+    call fs_load_huge_file
     jc .restore_and_builtin
 
     call restore_current_dir
 
-    xor ax, ax
-    xor bx, bx
-    xor cx, cx
-    xor dx, dx
     mov word si, [param_list]
-    xor di, di
-
-    call DisableMouse
-    call program_load_addr
-
-    mov ax, KERNEL_DATA_SEG
-    mov ds, ax
-    mov es, ax
-
-    call fs_reset_floppy
-    call EnableMouse
-    call font_reinstall
-    call load_and_apply_theme
+    call launch_bin_program
 
     popa
     jmp get_cmd
@@ -672,9 +662,9 @@ get_cmd:
 
     ; Try to load from current directory
     mov ax, command
-    xor bx, bx
-    mov cx, program_load_addr
-    call fs_load_file
+    mov cx, PROGRAM_LOAD_OFF
+    mov dx, PROGRAM_LOAD_SEG
+    call fs_load_huge_file
     jnc execute_bin
 
     ; If not found, try /BIN.DIR on current drive first
@@ -687,9 +677,9 @@ get_cmd:
     jc .restore_and_try_a_bin
 
     mov ax, command
-    xor bx, bx
-    mov cx, program_load_addr
-    call fs_load_file
+    mov cx, PROGRAM_LOAD_OFF
+    mov dx, PROGRAM_LOAD_SEG
+    call fs_load_huge_file
     jc .restore_and_try_a_bin
 
     call restore_current_dir
@@ -711,9 +701,9 @@ get_cmd:
     jc .restore_and_fail_a_bin
 
     mov ax, command
-    xor bx, bx
-    mov cx, program_load_addr
-    call fs_load_file
+    mov cx, PROGRAM_LOAD_OFF
+    mov dx, PROGRAM_LOAD_SEG
+    call fs_load_huge_file
     jc .restore_and_fail_a_bin
 
     call restore_current_dir
@@ -834,32 +824,103 @@ execute_bin:
     xor dx, dx
 
     mov ax, [param_list]
-    test ax, ax
-    je .no_params
     mov si, ax
-    jmp .continue
 
-.no_params:
-    xor si, si
+    call launch_bin_program
 
-.continue:
-    xor di, di
+    jmp get_cmd
 
-    ; Save kernel stack in case BIN modifies SS:SP.
+; ==================================================================
+; install_program_thunk -- writes the 1-byte "retf" stub to
+;                          PROGRAM_LOAD_SEG:PROGRAM_THUNK_OFF.
+; The thunk turns a program's terminal `ret` (near) into a far return
+; to the kernel. See launch_bin_program for the exact mechanism.
+; Called once during init.
+; ==================================================================
+install_program_thunk:
+    push ax
+    push es
+    push di
+    mov ax, PROGRAM_LOAD_SEG
+    mov es, ax
+    mov di, PROGRAM_THUNK_OFF
+    mov al, 0xCB                  ; opcode: retf
+    stosb
+    pop di
+    pop es
+    pop ax
+    ret
+
+; ==================================================================
+; launch_bin_program -- runs a BIN program already loaded at
+;                       PROGRAM_LOAD_SEG:PROGRAM_LOAD_OFF.
+;
+; IN:  SI = pointer to NUL-terminated param string in kernel DS,
+;           or 0 for no params. Other regs preserved into program.
+;
+; OUT: DS = ES = KERNEL_DATA_SEG, SS:SP restored, mouse/floppy/font
+;      and theme reinstalled. Caller resumes with kernel state intact.
+;
+; Stack layout when exec:
+;   [SP+0] = PROGRAM_THUNK_OFF   ; what program's near ret will pop
+;   [SP+2] = .program_done       ; IP for thunk's retf
+;   [SP+4] = kernel CS           ; CS for thunk's retf
+; ==================================================================
+launch_bin_program:
+    ; ---- Copy param string from kernel DS:SI to program seg ----
+    push ax
+    push si
+    push di
+    push es
+
+    test si, si
+    jz .no_params_copy
+
+    mov ax, PROGRAM_LOAD_SEG
+    mov es, ax
+    mov di, PROGRAM_PARAMS_OFF
+.copy_param:
+    lodsb
+    stosb
+    test al, al
+    jnz .copy_param
+
+.no_params_copy:
+    pop es
+    pop di
+    pop si
+    pop ax
+
+    ; ---- Save kernel stack in case BIN messes with SS:SP ----
     mov [bin_stack_save], sp
     mov [bin_ss_save], ss
 
     call DisableMouse
-    call program_load_addr
 
+    ; ---- Build trampoline frame on the (still kernel) stack ----
+    push cs                       ; -> [SP+4] for retf
+    push word .program_done       ; -> [SP+2] for retf
+    push word PROGRAM_THUNK_OFF   ; -> [SP+0] for program's near ret
+
+    ; ---- Set up program entry registers ----
+    test si, si
+    jz .si_zero
+    mov si, PROGRAM_PARAMS_OFF
+.si_zero:
+
+    mov ax, PROGRAM_LOAD_SEG
+    mov ds, ax
+    mov es, ax
+
+    jmp far PROGRAM_LOAD_SEG:PROGRAM_LOAD_OFF
+
+.program_done:
     cli
-    mov ax, [bin_ss_save]
-    mov ss, ax
-    mov sp, [bin_stack_save]
-
     mov ax, KERNEL_DATA_SEG
     mov ds, ax
     mov es, ax
+    mov ss, [bin_ss_save]
+    mov sp, [bin_stack_save]
     sti
 
     call fs_reset_floppy
@@ -867,7 +928,7 @@ execute_bin:
     call font_reinstall
     call load_and_apply_theme
 
-    jmp get_cmd
+    ret
 
 ; ============ Execute COM Program ============
 
@@ -1229,8 +1290,8 @@ cat_file:
     pop ax
     jc .not_found
 
-    mov cx, program_load_addr
-    mov dx, ds
+    mov cx, PROGRAM_LOAD_OFF
+    mov dx, PROGRAM_LOAD_SEG
 
     call fs_load_huge_file
     jc .load_fail
@@ -1242,8 +1303,8 @@ cat_file:
     or cx, dx
     jz .empty_file
 
-    mov word [.curr_seg], ds
-    mov word [.curr_off], program_load_addr
+    mov word [.curr_seg], PROGRAM_LOAD_SEG
+    mov word [.curr_off], PROGRAM_LOAD_OFF
     mov word [.line_count], 0
 
 .print_loop:
@@ -1427,14 +1488,17 @@ copy_file:
     call fs_file_exists
     jnc .already_exists
     mov ax, dx
-    mov cx, program_load_addr
-    mov dx, KERNEL_DATA_SEG
+    mov cx, PROGRAM_LOAD_OFF
+    mov dx, PROGRAM_LOAD_SEG
     call fs_load_huge_file
     jc .load_fail
-    mov cx, bx
-    mov bx, program_load_addr
+    ; DX:AX = file size
+    mov bx, ax                  ; size_low
+    mov di, dx                  ; size_high
+    mov cx, PROGRAM_LOAD_OFF
+    mov dx, PROGRAM_LOAD_SEG
     mov word ax, [.tmp]
-    call fs_write_file
+    call fs_write_huge_file
     jc .write_fail
     mov si, .success_msg
     call print_string_green
@@ -2268,6 +2332,7 @@ tmp_string         resb 15
 command            resb 32
 user               resb 32
 password           resb 32
+encrypted_pass     resb 32
 decrypted_pass     resb 32
 timezone           resb 32
 saved_directory    resb 32
@@ -2281,4 +2346,4 @@ temp_saved_cluster resw 1
 first_boot_buf     resb 8
 
 kernel_end:
-; kernel_end MUST stay below PROGRAM_LOAD_OFF (0x8000 = 32 KiB).
+; kernel_end MUST stay below DIRLIST_OFF (0xA800)
